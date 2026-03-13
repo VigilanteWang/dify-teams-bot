@@ -2,91 +2,335 @@
 // Licensed under the MIT License.
 const path = require('path');
 
-const { ActivityHandler, MessageFactory } = require('botbuilder');
-let fetch;
-if (parseInt(process.versions.node.split('.')[0]) >= 14) {
-  fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
-} else {
-  fetch = require('node-fetch');
-}
+const { ActivityHandler, ActivityTypes, MessageFactory } = require('botbuilder');
+const { DifyClient, DifyRequestError, DifyStreamError } = require('./services/difyClient');
 
 const dotenv = require('dotenv');
 // Import required bot configuration.
 const ENV_FILE = path.join(__dirname, '.env');
 dotenv.config({ path: ENV_FILE });
-var conversation_ids = {};
+const conversationIdsByUser = new Map();
+
+const DEFAULT_STREAM_UPDATE_INTERVAL_MS = 700;
+const DEFAULT_TYPING_INTERVAL_MS = 2500;
+const DEFAULT_STREAM_MIN_CHARS = 20;
+const DEFAULT_STREAM_CHANNELS = ['msteams', 'webchat', 'directline'];
+
+function parseBooleanFlag(value, defaultValue = false) {
+    if (value === undefined || value === null || value === '') {
+        return defaultValue;
+    }
+
+    const normalized = String(value).trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+        return true;
+    }
+
+    if (['0', 'false', 'no', 'off'].includes(normalized)) {
+        return false;
+    }
+
+    return defaultValue;
+}
+
+function parsePositiveInt(value, fallback) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        return fallback;
+    }
+
+    return Math.floor(parsed);
+}
+
+function parseChannelAllowList(value) {
+    if (!value) {
+        return new Set(DEFAULT_STREAM_CHANNELS);
+    }
+
+    const channels = String(value)
+        .split(',')
+        .map((item) => item.trim().toLowerCase())
+        .filter(Boolean);
+
+    if (channels.length === 0) {
+        return new Set(DEFAULT_STREAM_CHANNELS);
+    }
+
+    return new Set(channels);
+}
+
+const clientStreamingConfig = {
+    enabled: parseBooleanFlag(process.env.BOT_STREAMING_ENABLED, false),
+    allowedChannels: parseChannelAllowList(process.env.BOT_STREAMING_CHANNELS),
+    updateIntervalMs: parsePositiveInt(
+        process.env.BOT_STREAM_UPDATE_INTERVAL_MS,
+        DEFAULT_STREAM_UPDATE_INTERVAL_MS
+    ),
+    minCharsDelta: parsePositiveInt(
+        process.env.BOT_STREAM_MIN_CHARS_DELTA,
+        DEFAULT_STREAM_MIN_CHARS
+    ),
+    typingIntervalMs: parsePositiveInt(
+        process.env.BOT_TYPING_INTERVAL_MS,
+        DEFAULT_TYPING_INTERVAL_MS
+    )
+};
+
+function resolveUserKey(context) {
+    const channelId = context.activity.channelId || 'unknown';
+    const userId =
+        (context.activity.from && context.activity.from.id) ||
+        (context.activity.conversation && context.activity.conversation.id) ||
+        'anonymous';
+
+    return `${channelId}:${userId}`;
+}
+
+function toUserErrorMessage(error) {
+    const fallbackMessage =
+        'I hit an issue while talking to Dify. Please try again in a few seconds.';
+
+    if (error instanceof DifyRequestError) {
+        const parts = [
+            'Dify request failed.',
+            error.status ? `status=${error.status}` : null,
+            error.code ? `code=${error.code}` : null,
+            error.message ? `message=${error.message}` : null
+        ].filter(Boolean);
+        return `${parts.join(' ')}\n${fallbackMessage}`;
+    }
+
+    if (error instanceof DifyStreamError) {
+        return `Dify streaming response was invalid: ${error.message}.\n${fallbackMessage}`;
+    }
+
+    return fallbackMessage;
+}
+
+function shouldStreamToClient(context) {
+    if (!clientStreamingConfig.enabled) {
+        return false;
+    }
+
+    const channelId = (context.activity.channelId || '').toLowerCase();
+    if (!channelId) {
+        return false;
+    }
+
+    return clientStreamingConfig.allowedChannels.has(channelId);
+}
+
+function startTypingLoop(context, intervalMs) {
+    let active = true;
+
+    const sendTyping = async () => {
+        if (!active) {
+            return;
+        }
+
+        try {
+            await context.sendActivity({ type: ActivityTypes.Typing });
+        } catch (error) {
+            console.warn('Failed to send typing activity', { message: error.message });
+        }
+    };
+
+    void sendTyping();
+    const timer = setInterval(() => {
+        void sendTyping();
+    }, intervalMs);
+
+    return () => {
+        active = false;
+        clearInterval(timer);
+    };
+}
+
+async function collectDifyAnswer(client, { query, user, conversationId, onPartialText }) {
+    let answer = '';
+    let updatedConversationId = conversationId;
+    let streamEnded = false;
+
+    for await (const eventPayload of client.streamChatMessage({
+        query,
+        user,
+        conversationId,
+        inputs: {}
+    })) {
+        if (eventPayload.conversation_id) {
+            updatedConversationId = eventPayload.conversation_id;
+        }
+
+        switch (eventPayload.event) {
+            case 'message':
+                answer += eventPayload.answer || '';
+                if (onPartialText && answer) {
+                    await onPartialText(answer);
+                }
+                break;
+            case 'message_replace':
+                answer = eventPayload.answer || '';
+                if (onPartialText && answer) {
+                    await onPartialText(answer);
+                }
+                break;
+            case 'message_end':
+                streamEnded = true;
+                break;
+            case 'error':
+                throw new DifyStreamError(
+                    `Dify stream error: ${eventPayload.message || 'Unknown error'}`,
+                    {
+                        code: eventPayload.code,
+                        status: eventPayload.status,
+                        event: eventPayload.event,
+                        raw: eventPayload
+                    }
+                );
+            case 'ping':
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (!streamEnded && answer.length === 0) {
+        throw new DifyStreamError('Dify stream ended without answer content.');
+    }
+
+    return {
+        answer,
+        conversationId: updatedConversationId
+    };
+}
 
 class EchoBot extends ActivityHandler {
     constructor() {
         super();
+        this.difyClient = new DifyClient();
+
         // See https://aka.ms/about-bot-activity-message to learn more about the message and other activity types.
         this.onMessage(async (context, next) => {
+            const userKey = resolveUserKey(context);
+            const stopTypingLoop = startTypingLoop(context, clientStreamingConfig.typingIntervalMs);
+
             try {
-                let answer = "";
-                const myHeaders = new Headers();
-                myHeaders.append("Content-Type", "application/json");
-                myHeaders.append("Authorization", "Bearer " + process.env.API_KEY);
-                
-                const raw = JSON.stringify({
-                  "inputs": {},
-                  "query": context.activity.text,
-                  "response_mode": "streaming",
-                  "conversation_id": conversation_ids[context.activity.recipient.id] ? conversation_ids[context.activity.recipient.id] : '',
-                  "user": context.activity.recipient.id
-                });
-                
-                const requestOptions = {
-                  method: "POST",
-                  headers: myHeaders,
-                  body: raw,
-                  redirect: "follow"
-                };
+                const userMessage = (context.activity.text || '').trim();
+                if (!userMessage) {
+                    await context.sendActivity('Please send a text message.');
+                    await next();
+                    return;
+                }
 
-                const response = await fetch(process.env.API_ENDPOINT, requestOptions);
+                const streamToClient = shouldStreamToClient(context);
+                let replyActivityId = '';
+                let lastUpdatedText = '';
+                let lastUpdateAt = 0;
+                let updateFailed = false;
 
-                if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
-                } else {
-                    // The response body is a ReadableStream. You can use an async iterator to read the data.
-                    for await (const chunk of response.body) {
-                        // Each chunk is a Uint8Array. Convert it to a string.
-                        let text = new TextDecoder("utf-8").decode(chunk);
-                        // console.log(text);
-                        if (text.startsWith('data: ')) {
-                            text = text.slice(6);
-                        }
-                        try {
-                            let json_line = JSON.parse(text);
-                            if (json_line.conversation_id) {
-                                conversation_ids[context.activity.recipient.id] = json_line.conversation_id;
-                            }
-                            if (json_line.event === 'agent_thought') {
-                                answer += json_line.thought;
-                            }
-                        } catch (err) {
-                            console.error(err);
-                        }
+                if (streamToClient) {
+                    try {
+                        const placeholder = await context.sendActivity(
+                            MessageFactory.text('Thinking...')
+                        );
+                        replyActivityId = placeholder && placeholder.id ? placeholder.id : '';
+                    } catch (error) {
+                        updateFailed = true;
+                        console.warn('Unable to create placeholder activity', {
+                            message: error.message,
+                            channelId: context.activity.channelId
+                        });
                     }
                 }
 
-                console.log(answer);
-                console.log(conversation_ids);
-                // Send the response back to the user
-                await context.sendActivity(MessageFactory.text(answer, answer));
+                const onPartialText = async (partialText) => {
+                    if (!replyActivityId || updateFailed || !partialText) {
+                        return;
+                    }
+
+                    const now = Date.now();
+                    const hasMeaningfulDelta =
+                        partialText.length - lastUpdatedText.length >=
+                        clientStreamingConfig.minCharsDelta;
+                    const dueByTime = now - lastUpdateAt >= clientStreamingConfig.updateIntervalMs;
+
+                    if (!hasMeaningfulDelta && !dueByTime) {
+                        return;
+                    }
+
+                    try {
+                        await context.updateActivity({
+                            id: replyActivityId,
+                            type: ActivityTypes.Message,
+                            text: partialText
+                        });
+                        lastUpdatedText = partialText;
+                        lastUpdateAt = now;
+                    } catch (error) {
+                        updateFailed = true;
+                        console.warn('Incremental update failed, fallback to one-shot.', {
+                            message: error.message,
+                            channelId: context.activity.channelId
+                        });
+                    }
+                };
+
+                const difyResult = await collectDifyAnswer(this.difyClient, {
+                    query: userMessage,
+                    user: userKey,
+                    conversationId: conversationIdsByUser.get(userKey) || '',
+                    onPartialText: streamToClient ? onPartialText : null
+                });
+
+                if (difyResult.conversationId) {
+                    conversationIdsByUser.set(userKey, difyResult.conversationId);
+                }
+
+                const answer = difyResult.answer || '(No answer from Dify)';
+
+                if (replyActivityId && !updateFailed) {
+                    if (answer !== lastUpdatedText) {
+                        try {
+                            await context.updateActivity({
+                                id: replyActivityId,
+                                type: ActivityTypes.Message,
+                                text: answer
+                            });
+                        } catch (error) {
+                            console.warn('Final activity update failed, sending new message.', {
+                                message: error.message,
+                                channelId: context.activity.channelId
+                            });
+                            await context.sendActivity(MessageFactory.text(answer, answer));
+                        }
+                    }
+                } else {
+                    // Fallback path for channels or clients that cannot render message updates.
+                    await context.sendActivity(MessageFactory.text(answer, answer));
+                }
+
                 // By calling next() you ensure that the next BotHandler is run.
                 await next();
-            }
-            catch (err) {
-                console.error(`${err}`);
-                await context.sendActivity(MessageFactory.text(err));
-            }
+            } catch (err) {
+                console.error('Dify bot error', {
+                    message: err.message,
+                    name: err.name,
+                    status: err.status,
+                    code: err.code,
+                    raw: err.raw,
+                    stack: err.stack
+                });
 
-
+                await context.sendActivity(MessageFactory.text(toUserErrorMessage(err)));
+            } finally {
+                stopTypingLoop();
+            }
         });
 
         this.onMembersAdded(async (context, next) => {
             const membersAdded = context.activity.membersAdded;
-            const welcomeText = 'This is a bot that uses Azure OpenAI to generate responses.';
+            const welcomeText =
+                'This bot routes your messages to Dify and returns the generated response.';
             for (let cnt = 0; cnt < membersAdded.length; ++cnt) {
                 if (membersAdded[cnt].id !== context.activity.recipient.id) {
                     await context.sendActivity(MessageFactory.text(welcomeText, welcomeText));
