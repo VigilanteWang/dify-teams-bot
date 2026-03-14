@@ -9,6 +9,7 @@ const dotenv = require('dotenv');
 // Import required bot configuration.
 const ENV_FILE = path.join(__dirname, '.env');
 dotenv.config({ path: ENV_FILE });
+// 记录每个用户在 Dify 的 conversation_id，用于多轮对话上下文延续。
 const conversationIdsByUser = new Map();
 
 const DEFAULT_STREAM_UPDATE_INTERVAL_MS = 700;
@@ -16,6 +17,7 @@ const DEFAULT_STREAM_MIN_CHARS = 20;
 const DEFAULT_STREAM_FIRST_MESSAGE_MIN_CHARS = 10;
 const DEFAULT_STREAM_CHANNELS = ['msteams', 'webchat', 'directline'];
 
+// 把环境变量中的布尔值（如 true/false/1/0）解析成真正的布尔类型。
 function parseBooleanFlag(value, defaultValue = false) {
     if (value === undefined || value === null || value === '') {
         return defaultValue;
@@ -33,6 +35,7 @@ function parseBooleanFlag(value, defaultValue = false) {
     return defaultValue;
 }
 
+// 解析正整数配置；非法值时回退到默认值。
 function parsePositiveInt(value, fallback) {
     const parsed = Number(value);
     if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -42,6 +45,7 @@ function parsePositiveInt(value, fallback) {
     return Math.floor(parsed);
 }
 
+// 解析允许流式输出的频道列表，返回 Set 便于快速判断频道是否命中。
 function parseChannelAllowList(value) {
     if (!value) {
         return new Set(DEFAULT_STREAM_CHANNELS);
@@ -59,6 +63,7 @@ function parseChannelAllowList(value) {
     return new Set(channels);
 }
 
+// 客户端流式输出相关配置，集中从环境变量读取。
 const clientStreamingConfig = {
     enabled: parseBooleanFlag(process.env.BOT_STREAMING_ENABLED, false),
     allowedChannels: parseChannelAllowList(process.env.BOT_STREAMING_CHANNELS),
@@ -76,6 +81,7 @@ const clientStreamingConfig = {
     )
 };
 
+// 生成“频道 + 用户”的稳定键，用于定位该用户的会话上下文。
 function resolveUserKey(context) {
     const channelId = context.activity.channelId || 'unknown';
     const userId =
@@ -86,6 +92,7 @@ function resolveUserKey(context) {
     return `${channelId}:${userId}`;
 }
 
+// 把内部异常转换成更友好的用户可读提示。
 function toUserErrorMessage(error) {
     const fallbackMessage =
         'I hit an issue while talking to Dify. Please try again in a few seconds.';
@@ -107,6 +114,7 @@ function toUserErrorMessage(error) {
     return fallbackMessage;
 }
 
+// 判断当前消息是否应该走流式客户端更新。
 function shouldStreamToClient(context) {
     if (!clientStreamingConfig.enabled) {
         return false;
@@ -120,6 +128,8 @@ function shouldStreamToClient(context) {
     return clientStreamingConfig.allowedChannels.has(channelId);
 }
 
+// 拉取 Dify 的流式事件并在本地组装完整答案。
+// onPartialText 会在每次答案变化时被调用，用于驱动 Teams 的增量显示。
 async function collectDifyAnswer(client, { query, user, conversationId, onPartialText }) {
     let answer = '';
     let updatedConversationId = conversationId;
@@ -181,6 +191,7 @@ async function collectDifyAnswer(client, { query, user, conversationId, onPartia
 class EchoBot extends ActivityHandler {
     constructor() {
         super();
+        // 统一复用一个 Dify 客户端实例。
         this.difyClient = new DifyClient();
 
         // See https://aka.ms/about-bot-activity-message to learn more about the message and other activity types.
@@ -196,13 +207,17 @@ class EchoBot extends ActivityHandler {
                 }
 
                 const streamToClient = shouldStreamToClient(context);
+                // replyActivityId: 首条流式消息的 activity id，后续 updateActivity 依赖它。
                 let replyActivityId = '';
+                // lastUpdatedText / lastUpdateAt 用于做“字符增量 + 时间间隔”双阈值节流。
                 let lastUpdatedText = '';
                 let lastUpdateAt = 0;
+                // 一旦更新失败，切换到 one-shot 回退，不再继续增量更新。
                 let updateFailed = false;
 
                 if (streamToClient) {
                     try {
+                        // 仅发送一次 typing，提示用户机器人已开始处理。
                         await context.sendActivity({ type: ActivityTypes.Typing });
                     } catch (error) {
                         console.warn('Unable to send typing activity', {
@@ -212,6 +227,7 @@ class EchoBot extends ActivityHandler {
                     }
                 }
 
+                // 处理“部分文本更新”：首条消息先 send，后续都走 update。
                 const onPartialText = async (partialText) => {
                     if (updateFailed || !partialText) {
                         return;
@@ -220,6 +236,7 @@ class EchoBot extends ActivityHandler {
                     const now = Date.now();
 
                     if (!replyActivityId) {
+                        // 首条太短会造成 UI 抖动，先累积到阈值再发第一条。
                         if (partialText.length < clientStreamingConfig.firstMessageMinChars) {
                             return;
                         }
@@ -245,6 +262,7 @@ class EchoBot extends ActivityHandler {
                         return;
                     }
 
+                    // 双阈值：文本新增够多，或距离上次更新时间已到。
                     const hasMeaningfulDelta =
                         partialText.length - lastUpdatedText.length >=
                         clientStreamingConfig.minCharsDelta;
@@ -280,6 +298,7 @@ class EchoBot extends ActivityHandler {
                 });
 
                 if (difyResult.conversationId) {
+                    // 保存最新会话 id，下一轮继续使用同一会话上下文。
                     conversationIdsByUser.set(userKey, difyResult.conversationId);
                 }
 
@@ -288,6 +307,7 @@ class EchoBot extends ActivityHandler {
                 if (replyActivityId && !updateFailed) {
                     if (answer !== lastUpdatedText) {
                         try {
+                            // 最后一次强制对齐，确保客户端文本与 Dify 最终答案一致。
                             await context.updateActivity({
                                 id: replyActivityId,
                                 type: ActivityTypes.Message,
