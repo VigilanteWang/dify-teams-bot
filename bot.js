@@ -12,8 +12,8 @@ dotenv.config({ path: ENV_FILE });
 const conversationIdsByUser = new Map();
 
 const DEFAULT_STREAM_UPDATE_INTERVAL_MS = 700;
-const DEFAULT_TYPING_INTERVAL_MS = 2500;
 const DEFAULT_STREAM_MIN_CHARS = 20;
+const DEFAULT_STREAM_FIRST_MESSAGE_MIN_CHARS = 10;
 const DEFAULT_STREAM_CHANNELS = ['msteams', 'webchat', 'directline'];
 
 function parseBooleanFlag(value, defaultValue = false) {
@@ -70,9 +70,9 @@ const clientStreamingConfig = {
         process.env.BOT_STREAM_MIN_CHARS_DELTA,
         DEFAULT_STREAM_MIN_CHARS
     ),
-    typingIntervalMs: parsePositiveInt(
-        process.env.BOT_TYPING_INTERVAL_MS,
-        DEFAULT_TYPING_INTERVAL_MS
+    firstMessageMinChars: parsePositiveInt(
+        process.env.BOT_STREAM_FIRST_MESSAGE_MIN_CHARS,
+        DEFAULT_STREAM_FIRST_MESSAGE_MIN_CHARS
     )
 };
 
@@ -118,32 +118,6 @@ function shouldStreamToClient(context) {
     }
 
     return clientStreamingConfig.allowedChannels.has(channelId);
-}
-
-function startTypingLoop(context, intervalMs) {
-    let active = true;
-
-    const sendTyping = async () => {
-        if (!active) {
-            return;
-        }
-
-        try {
-            await context.sendActivity({ type: ActivityTypes.Typing });
-        } catch (error) {
-            console.warn('Failed to send typing activity', { message: error.message });
-        }
-    };
-
-    void sendTyping();
-    const timer = setInterval(() => {
-        void sendTyping();
-    }, intervalMs);
-
-    return () => {
-        active = false;
-        clearInterval(timer);
-    };
 }
 
 async function collectDifyAnswer(client, { query, user, conversationId, onPartialText }) {
@@ -212,7 +186,6 @@ class EchoBot extends ActivityHandler {
         // See https://aka.ms/about-bot-activity-message to learn more about the message and other activity types.
         this.onMessage(async (context, next) => {
             const userKey = resolveUserKey(context);
-            const stopTypingLoop = startTypingLoop(context, clientStreamingConfig.typingIntervalMs);
 
             try {
                 const userMessage = (context.activity.text || '').trim();
@@ -230,13 +203,9 @@ class EchoBot extends ActivityHandler {
 
                 if (streamToClient) {
                     try {
-                        const placeholder = await context.sendActivity(
-                            MessageFactory.text('Thinking...')
-                        );
-                        replyActivityId = placeholder && placeholder.id ? placeholder.id : '';
+                        await context.sendActivity({ type: ActivityTypes.Typing });
                     } catch (error) {
-                        updateFailed = true;
-                        console.warn('Unable to create placeholder activity', {
+                        console.warn('Unable to send typing activity', {
                             message: error.message,
                             channelId: context.activity.channelId
                         });
@@ -244,11 +213,38 @@ class EchoBot extends ActivityHandler {
                 }
 
                 const onPartialText = async (partialText) => {
-                    if (!replyActivityId || updateFailed || !partialText) {
+                    if (updateFailed || !partialText) {
                         return;
                     }
 
                     const now = Date.now();
+
+                    if (!replyActivityId) {
+                        if (partialText.length < clientStreamingConfig.firstMessageMinChars) {
+                            return;
+                        }
+
+                        try {
+                            const initialReply = await context.sendActivity(
+                                MessageFactory.text(partialText, partialText)
+                            );
+                            replyActivityId =
+                                initialReply && initialReply.id ? initialReply.id : '';
+                            lastUpdatedText = partialText;
+                            lastUpdateAt = now;
+                        } catch (error) {
+                            updateFailed = true;
+                            console.warn(
+                                'Initial streamed message send failed, fallback to one-shot.',
+                                {
+                                    message: error.message,
+                                    channelId: context.activity.channelId
+                                }
+                            );
+                        }
+                        return;
+                    }
+
                     const hasMeaningfulDelta =
                         partialText.length - lastUpdatedText.length >=
                         clientStreamingConfig.minCharsDelta;
@@ -264,6 +260,7 @@ class EchoBot extends ActivityHandler {
                             type: ActivityTypes.Message,
                             text: partialText
                         });
+
                         lastUpdatedText = partialText;
                         lastUpdateAt = now;
                     } catch (error) {
@@ -322,8 +319,6 @@ class EchoBot extends ActivityHandler {
                 });
 
                 await context.sendActivity(MessageFactory.text(toUserErrorMessage(err)));
-            } finally {
-                stopTypingLoop();
             }
         });
 
