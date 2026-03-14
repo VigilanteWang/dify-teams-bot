@@ -64,6 +64,10 @@ function parseChannelAllowList(value) {
 }
 
 // 客户端流式输出相关配置，集中从环境变量读取。
+// 说明：
+// 1) enabled 决定“是否启用增量更新”；
+// 2) allowedChannels 决定“哪些渠道允许 updateActivity”；
+// 3) 两类阈值控制更新频率，避免消息过于频繁导致界面闪烁或 API 压力过高。
 const clientStreamingConfig = {
     enabled: parseBooleanFlag(process.env.BOT_STREAMING_ENABLED, false),
     allowedChannels: parseChannelAllowList(process.env.BOT_STREAMING_CHANNELS),
@@ -117,11 +121,13 @@ function toUserErrorMessage(error) {
 // 判断当前消息是否应该走流式客户端更新。
 function shouldStreamToClient(context) {
     if (!clientStreamingConfig.enabled) {
+        // 全局开关关闭时，直接走一次性回复。
         return false;
     }
 
     const channelId = (context.activity.channelId || '').toLowerCase();
     if (!channelId) {
+        // 渠道未知时保守处理，避免误走不兼容的增量路径。
         return false;
     }
 
@@ -129,7 +135,7 @@ function shouldStreamToClient(context) {
 }
 
 // 拉取 Dify 的流式事件并在本地组装完整答案。
-// onPartialText 会在每次答案变化时被调用，用于驱动 Teams 的增量显示。
+// onPartialText 会在每次答案变化时被调用，用于驱动 Teams 消息的增量显示。
 async function collectDifyAnswer(client, { query, user, conversationId, onPartialText }) {
     let answer = '';
     let updatedConversationId = conversationId;
@@ -147,18 +153,21 @@ async function collectDifyAnswer(client, { query, user, conversationId, onPartia
 
         switch (eventPayload.event) {
             case 'message':
+                // 常见增量事件：把新片段追加到当前答案。
                 answer += eventPayload.answer || '';
                 if (onPartialText && answer) {
                     await onPartialText(answer);
                 }
                 break;
             case 'message_replace':
+                // 少见场景：服务端要求“整段替换”，而不是追加。
                 answer = eventPayload.answer || '';
                 if (onPartialText && answer) {
                     await onPartialText(answer);
                 }
                 break;
             case 'message_end':
+                // 明确结束标记：后续即使流关闭也视为正常完成。
                 streamEnded = true;
                 break;
             case 'error':
@@ -172,8 +181,10 @@ async function collectDifyAnswer(client, { query, user, conversationId, onPartia
                     }
                 );
             case 'ping':
+                // 心跳包：用于保活，无业务内容。
                 break;
             default:
+                // 为了兼容未来扩展事件，这里选择忽略未知类型。
                 break;
         }
     }
@@ -194,18 +205,20 @@ class EchoBot extends ActivityHandler {
         // 统一复用一个 Dify 客户端实例。
         this.difyClient = new DifyClient();
 
-        // See https://aka.ms/about-bot-activity-message to learn more about the message and other activity types.
+        // 消息主入口：用户每发一条文本消息，都会进入这里。
         this.onMessage(async (context, next) => {
             const userKey = resolveUserKey(context);
 
             try {
                 const userMessage = (context.activity.text || '').trim();
                 if (!userMessage) {
+                    // 新手常见问题：用户可能发空消息/附件，这里只接受文本输入。
                     await context.sendActivity('Please send a text message.');
                     await next();
                     return;
                 }
 
+                // 条件含义：同时满足“全局开启 + 当前渠道允许”才走流式更新。
                 const streamToClient = shouldStreamToClient(context);
                 // replyActivityId: 首条流式消息的 activity id，后续 updateActivity 依赖它。
                 let replyActivityId = '';
@@ -230,6 +243,7 @@ class EchoBot extends ActivityHandler {
                 // 处理“部分文本更新”：首条消息先 send，后续都走 update。
                 const onPartialText = async (partialText) => {
                     if (updateFailed || !partialText) {
+                        // update 失败后不再重试，避免重复报错；空文本也不需要发。
                         return;
                     }
 
@@ -263,6 +277,9 @@ class EchoBot extends ActivityHandler {
                     }
 
                     // 双阈值：文本新增够多，或距离上次更新时间已到。
+                    // 条件解释：
+                    // - hasMeaningfulDelta=true: 新增内容足够多，值得立刻刷新；
+                    // - dueByTime=true: 即使新增不多，也不让界面长时间不变化。
                     const hasMeaningfulDelta =
                         partialText.length - lastUpdatedText.length >=
                         clientStreamingConfig.minCharsDelta;
@@ -293,6 +310,7 @@ class EchoBot extends ActivityHandler {
                 const difyResult = await collectDifyAnswer(this.difyClient, {
                     query: userMessage,
                     user: userKey,
+                    // conversationId 不存在时传空串，代表开启新会话。
                     conversationId: conversationIdsByUser.get(userKey) || '',
                     onPartialText: streamToClient ? onPartialText : null
                 });
@@ -307,7 +325,7 @@ class EchoBot extends ActivityHandler {
                 if (replyActivityId && !updateFailed) {
                     if (answer !== lastUpdatedText) {
                         try {
-                            // 最后一次强制对齐，确保客户端文本与 Dify 最终答案一致。
+                            // 如果回答全文不一致，最后一次强制发送全文，确保客户端文本与 Dify 最终答案一致。
                             await context.updateActivity({
                                 id: replyActivityId,
                                 type: ActivityTypes.Message,
@@ -322,11 +340,14 @@ class EchoBot extends ActivityHandler {
                         }
                     }
                 } else {
-                    // Fallback path for channels or clients that cannot render message updates.
+                    // 回退路径：
+                    // 1) 渠道不支持流式更新；
+                    // 2) 增量更新中途失败；
+                    // 3) 未创建首条可更新消息。
                     await context.sendActivity(MessageFactory.text(answer, answer));
                 }
 
-                // By calling next() you ensure that the next BotHandler is run.
+                // 交给后续中间件/处理器继续执行（如果有注册）。
                 await next();
             } catch (err) {
                 console.error('Dify bot error', {
@@ -338,11 +359,13 @@ class EchoBot extends ActivityHandler {
                     stack: err.stack
                 });
 
+                // 统一转译为“对用户友好”的提示，避免直接暴露内部堆栈。
                 await context.sendActivity(MessageFactory.text(toUserErrorMessage(err)));
             }
         });
 
         this.onMembersAdded(async (context, next) => {
+            // 新成员加入会话时发送欢迎语（不对机器人自己发送）。
             const membersAdded = context.activity.membersAdded;
             const welcomeText =
                 'This bot routes your messages to Dify and returns the generated response.';
@@ -351,7 +374,7 @@ class EchoBot extends ActivityHandler {
                     await context.sendActivity(MessageFactory.text(welcomeText, welcomeText));
                 }
             }
-            // By calling next() you ensure that the next BotHandler is run.
+            // 保持与 onMessage 相同的处理链行为。
             await next();
         });
     }
